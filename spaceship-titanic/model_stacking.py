@@ -7,6 +7,10 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.feature_selection import SequentialFeatureSelector
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.model_selection import GridSearchCV
+from sklearn.feature_selection import SelectFromModel
+from scipy.stats import uniform, randint
+import numpy as np
+from sklearn.model_selection import cross_val_score
 
 from sklearn.ensemble import StackingClassifier
 from sklearn.linear_model import LogisticRegression
@@ -44,6 +48,12 @@ def clean_data(train, test):
         df['TotalSpend'] = df[spend_cols].fillna(0).sum(axis=1)
         df['NoSpend'] = (df[spend_cols].fillna(0).sum(axis=1) == 0).astype(int)
         df['Home_Destination'] = df['HomePlanet'] + '_' + df['Destination']
+
+        df['RoomService'] = df['RoomService'].fillna(0)
+        df['FoodCourt'] = df['FoodCourt'].fillna(0)
+        df['ShoppingMall'] = df['ShoppingMall'].fillna(0)
+        df['Spa'] = df['Spa'].fillna(0)
+        df['VRDeck'] = df['VRDeck'].fillna(0)
 
         # Convert boolean columns to integers for lightGBM
         #df['CryoSleep'] = df['CryoSleep'].astype(int)
@@ -167,6 +177,66 @@ def lgb_feature_importance(X, y):
 
     return important_features, gbm.score(X_test[important_features], y_test)
 
+def cat_feature_selection(X, y, threshold='median', random_state=42, verbose=0):
+    model = CatBoostClassifier(
+        iterations=300,
+        learning_rate=0.08,
+        depth=6,
+        random_seed=random_state,
+        verbose=verbose
+    )
+
+    model.fit(X, y)
+
+    # feature importances
+    importances = model.get_feature_importance(type="FeatureImportance")
+    feat_names = X.columns
+    imp_series = pd.Series(importances, index=feat_names).sort_values(ascending=False)
+
+    # selection
+    sfm = SelectFromModel(model, threshold=threshold, prefit=True)
+    mask = sfm.get_support()
+    selected = feat_names[mask].tolist()
+
+    try:
+        scoring = "roc_auc" if len(np.unique(y)) == 2 else "accuracy"
+        cv_score = cross_val_score(model, X, y, cv=3, scoring=scoring, n_jobs=-1).mean()
+    except Exception:
+        cv_score = None
+
+    return selected, imp_series, cv_score
+
+def cat_parameter_tuning(X, y, random_state=42, verbose=0):
+    base = CatBoostClassifier(verbose=0, random_seed=random_state)
+
+    param_distributions = {
+        "iterations": randint(200, 1500),
+        "depth": randint(4, 10),
+        "learning_rate": uniform(0.005, 0.3),
+        "l2_leaf_reg": uniform(0.1, 15),
+        "border_count": randint(32, 255),
+        "random_strength": uniform(0.0, 3.0),
+        "bagging_temperature": uniform(0.0, 1.5),
+        "subsample": uniform(0.6, 0.4),
+    }
+
+    scoring = "roc_auc" if len(np.unique(y)) == 2 else "accuracy"
+
+    search = RandomizedSearchCV(
+        estimator=base,
+        param_distributions=param_distributions,
+        n_iter=30,
+        scoring=scoring,
+        cv=3,
+        verbose=verbose,
+        random_state=random_state,
+        n_jobs=-1,
+        return_train_score=False
+    )
+
+    search.fit(X, y)
+    return search.best_params_, search.best_score_
+
 if __name__ == "__main__":
     train = pd.read_csv('kaggle/input/spaceship-titanic/train.csv')
     test = pd.read_csv('kaggle/input/spaceship-titanic/test.csv')
@@ -176,8 +246,6 @@ if __name__ == "__main__":
     train['CryoSleep'] = train['CryoSleep'].astype(int)
     train['VIP'] = train['VIP'].astype(int)
 
-    print(test.CryoSleep.isna().sum())
-    print(test.VIP.isna().sum())
     test['CryoSleep'] = test['CryoSleep'].astype(int)
     test['VIP'] = test['VIP'].astype(int)
     
@@ -195,38 +263,55 @@ if __name__ == "__main__":
     print("Feature importance:", feature_importance)
     print("Test accuracy:", test_accuracy)
 
+    print("CatBoost feature selection:")
+    selected_features_cat, imp_series, cv_score = cat_feature_selection(X, y)
+    print("Selected features:", selected_features_cat)
+    print("Importances:", imp_series)
+    print("CV score:", cv_score)
+
     X_xgb_test = test[selected_features]
     X_lgb_test = test[feature_importance]
+    X_cat_test = test[selected_features_cat]
 
     print("XGBoost parameter tuning:")
-    best_params, best_score = xgb_parameter_tuning(X[selected_features], y)
-    print("Best parameters:", best_params)
+    best_params_xgb, best_score = xgb_parameter_tuning(X[selected_features], y)
+    print("Best parameters:", best_params_xgb)
     print("Best score:", best_score)
 
     print("LightGBM parameter tuning:")
-    best_params, best_score = lgb_parameter_tuning(X[feature_importance], y)
-    print("Best parameters:", best_params)
+    best_params_lgb, best_score = lgb_parameter_tuning(X[feature_importance], y)
+    print("Best parameters:", best_params_lgb)
     print("Best score:", best_score)
 
-    xgb_model = XGBClassifier(**best_params)
+    print("CatBoost parameter tuning:")
+    best_params_cat, best_score = cat_parameter_tuning(X[selected_features_cat], y)
+    print("Best parameters:", best_params_cat)
+    print("Best score:", best_score)
+
+
+    xgb_model = XGBClassifier(**best_params_xgb)
     xgb_model.fit(X[selected_features], y)
     #test['Transported'] = xgb_model.predict(X_xgb_test)
     #test['Transported'] = test['Transported'].astype(bool) # convert back
     #submission = test[['PassengerId', 'Transported']]
     #submission.to_csv('submission_xgb.csv', index=False)
 
-    lgb_model = LGBMClassifier(**best_params)
+    lgb_model = LGBMClassifier(verbose=0, random_seed=RANDOM_SEED,**best_params_lgb)
     lgb_model.fit(X[feature_importance], y)
     #test['Transported'] = lgb_model.predict(X_lgb_test)
     #test['Transported'] = test['Transported'].astype(bool) # convert back
     #submission = test[['PassengerId', 'Transported']]
     #submission.to_csv('submission_lgb.csv', index=False)
 
+    cat_model = CatBoostClassifier(verbose=0, random_seed=RANDOM_SEED, **best_params_cat)
+    cat_model.fit(X[selected_features_cat], y)
+
     # Prepare the stacking ensemble
     stack = StackingClassifier(
         estimators=[
             ('xgb', xgb_model),
-            ('lgb', lgb_model)
+            #('lgb', lgb_model),
+            ('cat', cat_model)
             # You can add CatBoost or others here if you want
         ],
         final_estimator=LogisticRegression(max_iter=1000),
@@ -245,7 +330,7 @@ if __name__ == "__main__":
     test['Transported'] = stack.predict(X_test_stack)
     test['Transported'] = test['Transported'].astype(bool)
     submission = test[['PassengerId', 'Transported']]
-    submission.to_csv('submission_stack_v2.csv', index=False)
+    submission.to_csv('submission_stack.csv', index=False)
 
 
     

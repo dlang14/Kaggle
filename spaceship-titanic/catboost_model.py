@@ -68,7 +68,7 @@ def clean_data(train, test):
 
     return train, test
 
-def cat_feature_selection(X, y, threshold='median', random_state=42, verbose=0):
+def cat_feature_selection(X, y, threshold='median', random_state=RANDOM_SEED, verbose=0):
     model = CatBoostClassifier(
         iterations=300,
         learning_rate=0.08,
@@ -91,14 +91,13 @@ def cat_feature_selection(X, y, threshold='median', random_state=42, verbose=0):
 
     try:
         scoring = "roc_auc" if len(np.unique(y)) == 2 else "accuracy"
-        print(scoring)
         cv_score = cross_val_score(model, X, y, cv=3, scoring=scoring, n_jobs=-1).mean()
     except Exception:
         cv_score = None
 
     return selected, imp_series, cv_score
 
-def cat_parameter_tuning(X, y, random_state=42, verbose=0):
+def cat_parameter_tuning(X, y, random_state=RANDOM_SEED, verbose=0):
     base = CatBoostClassifier(verbose=0, random_seed=random_state)
 
     param_distributions = {
